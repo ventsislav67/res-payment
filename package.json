@@ -1,25 +1,19 @@
 {
-  "name": "restaurant-software-app",
+  "name": "res-payment",
   "version": "1.0.0",
   "private": true,
-  "description": "Restaurant frontend and payment API server",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js",
-    "check": "node --check server.js && node --check src/WaiterDashboard/script.js && node --check src/WaiterDashboard/payment.js && node --check src/WaiterDashboard/payment-result.js && node --check functions/index.js"
+    "start": "node server.js"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
-    "@dataconnect/admin-generated": "file:src/dataconnect-admin-generated",
-    "axios": "^1.7.9",
     "cors": "^2.8.5",
-    "dotenv": "^16.4.7",
-    "express": "^4.19.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.2",
     "firebase-admin": "^12.7.0",
-    "firebase-functions": "^6.1.2",
-    "stripe": "^18.0.0"
+    "stripe": "^17.5.0"
   }
 }
