@@ -14,16 +14,36 @@ const STRIPE_CURRENCY = "eur";
 const STRIPE_API_VERSION = "2026-02-25.clover";
 
 function initFirebaseAdmin() {
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (!raw) {
-    throw new Error("Missing FIREBASE_SERVICE_ACCOUNT_JSON environment variable.");
-  }
-
   let serviceAccount;
-  try {
-    serviceAccount = JSON.parse(raw);
-  } catch (err) {
-    throw new Error("Invalid FIREBASE_SERVICE_ACCOUNT_JSON environment variable.");
+
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    try {
+      serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    } catch (err) {
+      throw new Error("Invalid FIREBASE_SERVICE_ACCOUNT_JSON environment variable.");
+    }
+  } else if (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
+    try {
+      const decoded = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, "base64").toString("utf8");
+      serviceAccount = JSON.parse(decoded);
+    } catch (err) {
+      throw new Error("Invalid FIREBASE_SERVICE_ACCOUNT_BASE64 environment variable.");
+    }
+  } else if (
+    process.env.FIREBASE_PROJECT_ID &&
+    process.env.FIREBASE_CLIENT_EMAIL &&
+    process.env.FIREBASE_PRIVATE_KEY
+  ) {
+    serviceAccount = {
+      project_id: process.env.FIREBASE_PROJECT_ID,
+      client_email: process.env.FIREBASE_CLIENT_EMAIL,
+      private_key: process.env.FIREBASE_PRIVATE_KEY
+    };
+  } else {
+    throw new Error(
+      "Missing Firebase Admin credentials. Set FIREBASE_SERVICE_ACCOUNT_JSON, " +
+      "FIREBASE_SERVICE_ACCOUNT_BASE64, or FIREBASE_PROJECT_ID/FIREBASE_CLIENT_EMAIL/FIREBASE_PRIVATE_KEY."
+    );
   }
 
   if (serviceAccount.private_key) {
@@ -73,6 +93,14 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
+
+app.post([
+  "/api/payments/stripe/webhook",
+  "/webhook/stripe",
+  "/api/webhooks/stripe",
+  "/webhooks/stripe"
+], express.raw({ type: "application/json" }), handleStripeWebhook);
+
 app.use(express.json({ limit: "1mb" }));
 
 function httpError(statusCode, message) {
@@ -273,8 +301,22 @@ function buildCancelUrl(baseUrl, { provider, paymentId, orderId }) {
 }
 
 async function findPaymentByStripeSessionId(sessionId) {
-  const snap = await getDb().collection("payments")
+  let snap = await getDb().collection("payments")
     .where("stripeSessionId", "==", sessionId)
+    .limit(1)
+    .get();
+  if (snap.empty) {
+    snap = await getDb().collection("payments")
+      .where("stripeCheckoutSessionId", "==", sessionId)
+      .limit(1)
+      .get();
+  }
+  return snap.empty ? null : snap.docs[0];
+}
+
+async function findPaymentByStripePaymentIntentId(paymentIntentId) {
+  const snap = await getDb().collection("payments")
+    .where("stripePaymentIntentId", "==", paymentIntentId)
     .limit(1)
     .get();
   return snap.empty ? null : snap.docs[0];
@@ -306,19 +348,34 @@ async function resolvePaymentSnap({ paymentId, sessionId, orderId }) {
   throw httpError(400, "Missing paymentId, sessionId or orderId.");
 }
 
-function normalizeCheckoutStatus(session, currentStatus) {
-  if (currentStatus === "paid") return "paid";
-  if (session.payment_status === "paid") return "paid";
+function isPaidRecord(data) {
+  const status = String(data?.status || data?.paymentStatus || "").trim().toLowerCase();
+  return data?.paid === true || ["successful", "paid", "succeeded", "confirmed"].includes(status);
+}
+
+function normalizeCheckoutStatus(session, currentStatus, currentPaid = false) {
+  const normalizedCurrent = String(currentStatus || "").trim().toLowerCase();
+  if (currentPaid || ["successful", "paid", "succeeded", "confirmed"].includes(normalizedCurrent)) {
+    return "successful";
+  }
+  if (session.payment_status === "paid" || session.payment_status === "no_payment_required") {
+    return "successful";
+  }
   if (session.status === "expired" || session.status === "canceled") return "cancelled";
-  return currentStatus || "pending";
+  return normalizedCurrent || "pending";
 }
 
 async function handleCreateStripeCheckoutSession(req, res, options = {}) {
   const stripe = requireStripe();
   const body = req.body || {};
+  const method = options.method === "revolut" ? "revolut" : "card";
+  const resultProvider = method === "revolut" ? "revolut" : "stripe";
   const orderId = String(body.orderId || "").trim();
   const setup = await loadOrder(orderId);
   const tableId = String(body.tableId || setup.data.tableId || "").trim();
+  const waiterId = String(
+    options.user?.uid || setup.data.waiterId || setup.data.createdBy || ""
+  ).trim();
   const tipAmount = roundMoney(Math.max(0, safeNumber(body.tipAmount, 0)));
   const totalAmount = roundMoney(setup.amount + tipAmount);
 
@@ -330,12 +387,12 @@ async function handleCreateStripeCheckoutSession(req, res, options = {}) {
   const paymentId = paymentRef.id;
 
   const successUrl = buildSuccessUrl(body.successUrl, {
-    provider: "stripe",
+    provider: resultProvider,
     paymentId,
     orderId: setup.id
   });
   const cancelUrl = buildCancelUrl(body.cancelUrl, {
-    provider: "stripe",
+    provider: resultProvider,
     paymentId,
     orderId: setup.id
   });
@@ -344,17 +401,21 @@ async function handleCreateStripeCheckoutSession(req, res, options = {}) {
     paymentId,
     orderId: setup.id,
     tableId,
+    method,
+    waiterId: waiterId || "public_customer",
     source: options.source || "qr_client_demo"
   };
 
   const now = FieldValue.serverTimestamp();
   await paymentRef.set({
     provider: "stripe",
-    method: "card",
+    method,
     status: "pending",
     paymentStatus: "pending",
+    paid: false,
     orderId: setup.id,
     tableId,
+    waiterId: waiterId || null,
     amount: setup.amount,
     tipAmount,
     totalAmount,
@@ -365,34 +426,69 @@ async function handleCreateStripeCheckoutSession(req, res, options = {}) {
     updatedAt: now
   });
 
-  const session = await stripe.checkout.sessions.create({
-    mode: "payment",
-    payment_method_types: ["card"],
-    line_items: [
-      {
-        price_data: {
-          currency: STRIPE_CURRENCY,
-          product_data: {
-            name: `Restaurant order ${setup.id}`
+  let session;
+  try {
+    session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      payment_method_types: method === "revolut" ? ["revolut_pay"] : ["card"],
+      line_items: [
+        {
+          price_data: {
+            currency: STRIPE_CURRENCY,
+            product_data: {
+              name: `Restaurant order ${setup.id}`
+            },
+            unit_amount: toCents(totalAmount)
           },
-          unit_amount: toCents(totalAmount)
-        },
-        quantity: 1
+          quantity: 1
+        }
+      ],
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      metadata,
+      payment_intent_data: {
+        metadata
       }
-    ],
-    success_url: successUrl,
-    cancel_url: cancelUrl,
-    metadata,
-    payment_intent_data: {
-      metadata
-    }
-  });
+    });
+  } catch (err) {
+    console.error("[payments] Stripe Checkout creation failed", {
+      paymentId,
+      orderId: setup.id,
+      method,
+      error: err.message
+    });
+    await paymentRef.set({
+      status: "failed",
+      paymentStatus: "failed",
+      failureMessage: err.message || "Stripe Checkout creation failed.",
+      failedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp()
+    }, { merge: true });
+    throw err;
+  }
 
   await paymentRef.set({
     stripeSessionId: session.id,
+    stripeCheckoutSessionId: session.id,
     checkoutUrl: session.url || "",
     updatedAt: FieldValue.serverTimestamp()
   }, { merge: true });
+
+  await setup.ref.set({
+    paymentStatus: "pending",
+    paymentPending: true,
+    pendingPaymentId: paymentId,
+    pendingPaymentMethod: method,
+    updatedAt: FieldValue.serverTimestamp()
+  }, { merge: true });
+
+  console.log("[payments] Stripe Checkout session created", {
+    paymentId,
+    orderId: setup.id,
+    tableId,
+    method,
+    stripeSessionId: session.id
+  });
 
   res.json({
     checkoutUrl: session.url,
@@ -401,42 +497,135 @@ async function handleCreateStripeCheckoutSession(req, res, options = {}) {
   });
 }
 
-async function markStripePaymentPaid({ paymentSnap, session }) {
+async function markStripePaymentSuccessful({ paymentSnap, session }) {
   const paymentId = paymentSnap.id;
   const paymentRef = paymentSnap.ref;
-  const payment = paymentSnap.data() || {};
-  const orderId = payment.orderId || session.metadata?.orderId || "";
-  const tableId = payment.tableId || session.metadata?.tableId || "";
   const paymentIntentId = typeof session.payment_intent === "string"
     ? session.payment_intent
     : session.payment_intent?.id || "";
-  const now = FieldValue.serverTimestamp();
+  const db = getDb();
 
-  await paymentRef.set({
-    status: "paid",
-    paymentStatus: "paid",
-    stripePaymentIntentId: paymentIntentId,
-    paidAt: now,
-    updatedAt: now
-  }, { merge: true });
+  const result = await db.runTransaction(async (tx) => {
+    const freshPaymentSnap = await tx.get(paymentRef);
+    if (!freshPaymentSnap.exists) {
+      throw httpError(404, "Payment not found.");
+    }
 
-  if (orderId) {
-    await getDb().collection("orders").doc(orderId).set({
-      status: "paid",
+    const payment = freshPaymentSnap.data() || {};
+    const orderId = String(
+      payment.orderId || session.metadata?.orderId || session.metadata?.order_id || ""
+    ).trim();
+    const method = String(payment.method || session.metadata?.method || "card").trim().toLowerCase();
+
+    if (!orderId) {
+      console.warn("[payments] Stripe confirmation is missing order metadata", {
+        paymentId,
+        stripeSessionId: session.id || "",
+        stripePaymentIntentId: paymentIntentId
+      });
+      throw httpError(400, "Stripe payment is missing orderId metadata.");
+    }
+
+    const orderRef = db.collection("orders").doc(orderId);
+    const orderSnap = await tx.get(orderRef);
+
+    if (!orderSnap.exists) {
+      throw httpError(404, "Order not found.");
+    }
+
+    const order = orderSnap.data() || {};
+    const tableId = String(
+      payment.tableId || session.metadata?.tableId || session.metadata?.table_id || order.tableId || ""
+    ).trim();
+    const tableRef = tableId ? db.collection("tables").doc(tableId) : null;
+    const tableSnap = tableRef ? await tx.get(tableRef) : null;
+    const table = tableSnap?.exists ? (tableSnap.data() || {}) : {};
+    const activeOrderIds = [];
+    const addActiveOrder = (value) => {
+      const id = String(value || "").trim();
+      if (id && id !== orderId && !activeOrderIds.includes(id)) activeOrderIds.push(id);
+    };
+
+    (Array.isArray(table.activeOrders) ? table.activeOrders : []).forEach(addActiveOrder);
+    addActiveOrder(table.currentOrderId);
+    addActiveOrder(table.activeOrderId);
+
+    const otherOrderSnaps = await Promise.all(
+      activeOrderIds.map((id) => tx.get(db.collection("orders").doc(id)))
+    );
+    const remainingUnpaidOrderIds = activeOrderIds.filter((id, index) => {
+      const otherOrderSnap = otherOrderSnaps[index];
+      return otherOrderSnap.exists && !isPaidRecord(otherOrderSnap.data() || {});
+    });
+
+    const now = FieldValue.serverTimestamp();
+    const paymentReference = paymentIntentId || session.id || payment.paymentReference || "";
+    const sessionTotal = Number.isFinite(Number(session.amount_total))
+      ? roundMoney(Number(session.amount_total) / 100)
+      : safeNumber(payment.totalAmount, 0);
+    const alreadySuccessful = isPaidRecord(payment) && isPaidRecord(order);
+
+    tx.set(paymentRef, {
+      status: "successful",
       paymentStatus: "paid",
-      paidAt: now,
+      paid: true,
+      paidAt: payment.paidAt || now,
+      provider: "stripe",
+      method,
+      totalAmount: sessionTotal,
+      currency: String(session.currency || payment.currency || CURRENCY).toUpperCase(),
+      stripeAmountTotal: Number.isFinite(Number(session.amount_total))
+        ? Number(session.amount_total)
+        : null,
+      stripeSessionId: session.id || payment.stripeSessionId || "",
+      stripeCheckoutSessionId: session.id || payment.stripeCheckoutSessionId || "",
+      stripePaymentIntentId: paymentIntentId || payment.stripePaymentIntentId || "",
+      stripeCheckoutStatus: session.status || "",
+      stripePaymentStatus: session.payment_status || "",
+      paymentReference,
+      providerPaymentId: paymentReference,
       updatedAt: now
     }, { merge: true });
-  }
 
-  if (tableId) {
-    await getDb().collection("tables").doc(tableId).set({
-      status: "free",
-      activeOrders: [],
-      currentOrderId: "",
+    tx.set(orderRef, {
+      status: "paid",
+      orderStatus: "closed",
+      paymentStatus: "paid",
+      paid: true,
+      paidAt: order.paidAt || now,
+      closedAt: order.closedAt || now,
+      paymentId,
+      paymentMethod: method,
+      paymentProvider: "stripe",
+      paymentReference,
+      paymentPending: false,
+      pendingPaymentId: null,
+      pendingPaymentMethod: null,
       updatedAt: now
     }, { merge: true });
-  }
+
+    if (tableRef) {
+      const nextActiveOrderId = remainingUnpaidOrderIds[0] || null;
+      tx.set(tableRef, {
+        status: remainingUnpaidOrderIds.length ? "busy" : "free",
+        activeOrders: remainingUnpaidOrderIds,
+        activeOrderId: nextActiveOrderId,
+        currentOrderId: nextActiveOrderId || "",
+        updatedAt: now
+      }, { merge: true });
+    }
+
+    return { alreadySuccessful, orderId, tableId, method, paymentReference };
+  });
+
+  console.log("[payments] Payment marked successful", {
+    paymentId,
+    orderId: result.orderId,
+    tableId: result.tableId,
+    method: result.method,
+    paymentReference: result.paymentReference,
+    alreadySuccessful: result.alreadySuccessful
+  });
 
   return paymentRef.get();
 }
@@ -460,15 +649,20 @@ async function handleCheckPayment(req, res) {
   let status = payment.status || payment.paymentStatus || "pending";
   let paymentStatus = payment.paymentStatus || payment.status || "pending";
 
-  if (payment.provider === "stripe" && payment.stripeSessionId) {
+  if (payment.provider === "stripe" && (payment.stripeSessionId || payment.stripeCheckoutSessionId)) {
     const stripe = requireStripe();
-    const session = await stripe.checkout.sessions.retrieve(payment.stripeSessionId);
-    status = normalizeCheckoutStatus(session, status);
-    paymentStatus = status;
+    const session = await stripe.checkout.sessions.retrieve(
+      payment.stripeSessionId || payment.stripeCheckoutSessionId,
+      {
+      expand: ["payment_intent"]
+      }
+    );
+    status = normalizeCheckoutStatus(session, status, payment.paid === true);
+    paymentStatus = status === "successful" ? "paid" : status;
 
-    if (session.payment_status === "paid") {
-      paymentSnap = await markStripePaymentPaid({ paymentSnap, session });
-      status = "paid";
+    if (status === "successful") {
+      paymentSnap = await markStripePaymentSuccessful({ paymentSnap, session });
+      status = "successful";
       paymentStatus = "paid";
     } else {
       await paymentSnap.ref.set({
@@ -493,6 +687,184 @@ async function handleCheckPayment(req, res) {
     currency: nextPayment?.currency || payment.currency || CURRENCY,
     payment: nextPayment
   });
+}
+
+async function resolveStripePaymentSnap({ metadata, sessionId, paymentIntentId }) {
+  const metadataPaymentId = String(metadata?.paymentId || metadata?.payment_id || "").trim();
+
+  if (metadataPaymentId) {
+    const paymentSnap = await getDb().collection("payments").doc(metadataPaymentId).get();
+    if (paymentSnap.exists) return paymentSnap;
+
+    console.warn("[payments] Stripe metadata paymentId was not found", {
+      paymentId: metadataPaymentId,
+      sessionId: sessionId || "",
+      paymentIntentId: paymentIntentId || ""
+    });
+  } else {
+    console.warn("[payments] Stripe event is missing paymentId metadata", {
+      sessionId: sessionId || "",
+      paymentIntentId: paymentIntentId || ""
+    });
+  }
+
+  if (sessionId) {
+    const bySession = await findPaymentByStripeSessionId(sessionId);
+    if (bySession?.exists) return bySession;
+  }
+
+  if (paymentIntentId) {
+    const byIntent = await findPaymentByStripePaymentIntentId(paymentIntentId);
+    if (byIntent?.exists) return byIntent;
+  }
+
+  return null;
+}
+
+async function confirmStripeCheckoutSession(session, source) {
+  const paymentIntentId = typeof session.payment_intent === "string"
+    ? session.payment_intent
+    : session.payment_intent?.id || "";
+  const status = normalizeCheckoutStatus(session, "pending");
+
+  if (status !== "successful") {
+    return {
+      ok: false,
+      status,
+      paymentId: String(session.metadata?.paymentId || session.metadata?.payment_id || "").trim() || null,
+      orderId: String(session.metadata?.orderId || session.metadata?.order_id || "").trim() || null,
+      tableId: String(session.metadata?.tableId || session.metadata?.table_id || "").trim() || null
+    };
+  }
+
+  const paymentSnap = await resolveStripePaymentSnap({
+    metadata: session.metadata,
+    sessionId: session.id,
+    paymentIntentId
+  });
+  if (!paymentSnap?.exists) {
+    throw httpError(404, "Stripe payment record not found.");
+  }
+
+  const updatedPaymentSnap = await markStripePaymentSuccessful({ paymentSnap, session });
+  const payment = updatedPaymentSnap.data() || {};
+
+  return {
+    ok: true,
+    status: "successful",
+    paymentStatus: "paid",
+    paymentId: updatedPaymentSnap.id,
+    orderId: payment.orderId || session.metadata?.orderId || session.metadata?.order_id || null,
+    tableId: payment.tableId || session.metadata?.tableId || session.metadata?.table_id || null,
+    source,
+    payment: publicPaymentData(updatedPaymentSnap)
+  };
+}
+
+async function handleStripeWebhook(req, res) {
+  const stripe = getStripe();
+  const webhookSecret = String(process.env.STRIPE_WEBHOOK_SECRET || "").trim();
+  if (!stripe || !webhookSecret) {
+    return res.status(500).json({ error: "Stripe webhook is not configured." });
+  }
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      req.headers["stripe-signature"],
+      webhookSecret
+    );
+  } catch (err) {
+    console.warn("[payments] Stripe webhook signature verification failed", {
+      error: err.message
+    });
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  console.log("[payments] Stripe webhook received", {
+    eventId: event.id,
+    type: event.type
+  });
+
+  try {
+    if (
+      event.type === "checkout.session.completed" ||
+      event.type === "checkout.session.async_payment_succeeded"
+    ) {
+      const eventSession = event.data.object;
+      const session = await stripe.checkout.sessions.retrieve(eventSession.id, {
+        expand: ["payment_intent"]
+      });
+      await confirmStripeCheckoutSession(session, `webhook:${event.type}`);
+    } else if (event.type === "payment_intent.succeeded") {
+      const paymentIntent = event.data.object;
+      const paymentSnap = await resolveStripePaymentSnap({
+        metadata: paymentIntent.metadata,
+        paymentIntentId: paymentIntent.id
+      });
+
+      if (paymentSnap?.exists) {
+        const payment = paymentSnap.data() || {};
+        await markStripePaymentSuccessful({
+          paymentSnap,
+          session: {
+            id: payment.stripeSessionId || payment.stripeCheckoutSessionId || "",
+            metadata: paymentIntent.metadata || {},
+            payment_intent: paymentIntent,
+            amount_total: paymentIntent.amount_received || paymentIntent.amount,
+            payment_status: "paid",
+            status: "complete"
+          }
+        });
+      }
+    } else if (event.type === "payment_intent.payment_failed") {
+      const paymentIntent = event.data.object;
+      const paymentSnap = await resolveStripePaymentSnap({
+        metadata: paymentIntent.metadata,
+        paymentIntentId: paymentIntent.id
+      });
+
+      if (paymentSnap?.exists && !isPaidRecord(paymentSnap.data() || {})) {
+        await paymentSnap.ref.set({
+          status: "failed",
+          paymentStatus: "failed",
+          paid: false,
+          stripePaymentIntentId: paymentIntent.id,
+          failureMessage: paymentIntent.last_payment_error?.message || "Payment failed.",
+          failedAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp()
+        }, { merge: true });
+      }
+    } else if (event.type === "checkout.session.expired") {
+      const session = event.data.object;
+      const paymentSnap = await resolveStripePaymentSnap({
+        metadata: session.metadata,
+        sessionId: session.id,
+        paymentIntentId: typeof session.payment_intent === "string" ? session.payment_intent : ""
+      });
+
+      if (paymentSnap?.exists && !isPaidRecord(paymentSnap.data() || {})) {
+        await paymentSnap.ref.set({
+          status: "cancelled",
+          paymentStatus: "cancelled",
+          paid: false,
+          stripeCheckoutStatus: session.status || "expired",
+          cancelledAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp()
+        }, { merge: true });
+      }
+    }
+
+    return res.json({ received: true });
+  } catch (err) {
+    console.error("[payments] Stripe webhook update failed", {
+      eventId: event.id,
+      type: event.type,
+      error: err.message
+    });
+    return sendError(res, err);
+  }
 }
 
 async function handleCreateBankTransfer(req, res, user) {
@@ -557,18 +929,126 @@ app.get("/api/health", (req, res) => {
 });
 
 app.post("/api/public/payments/stripe/create-checkout-session", asyncRoute((req, res) => {
-  return handleCreateStripeCheckoutSession(req, res, { source: "qr_client_demo" });
+  return handleCreateStripeCheckoutSession(req, res, {
+    source: "qr_client_demo",
+    method: "card"
+  });
 }));
 
 app.post("/api/public/payments/stripe/checkout-session", asyncRoute((req, res) => {
-  return handleCreateStripeCheckoutSession(req, res, { source: "qr_client_demo" });
+  return handleCreateStripeCheckoutSession(req, res, {
+    source: "qr_client_demo",
+    method: "card"
+  });
+}));
+
+app.post("/api/public/payments/revolut/create-order", asyncRoute((req, res) => {
+  return handleCreateStripeCheckoutSession(req, res, {
+    source: "qr_client_demo",
+    method: "revolut"
+  });
 }));
 
 app.post("/api/public/payments/check", asyncRoute(handleCheckPayment));
 
+async function handleConfirmStripeSession(req, res) {
+  const sessionId = String(req.query.session_id || req.query.sessionId || "").trim();
+  if (!sessionId) {
+    return res.status(400).json({
+      ok: false,
+      error: "Missing session_id"
+    });
+  }
+
+  console.log("Confirming Stripe session:", sessionId);
+
+  try {
+    const stripe = requireStripe();
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ["payment_intent"]
+    });
+
+    if (!session) {
+      return res.status(404).json({
+        ok: false,
+        error: "Stripe session not found"
+      });
+    }
+
+    if (session.payment_status !== "paid") {
+      return res.json({
+        ok: false,
+        status: session.payment_status || "pending",
+        message: "Stripe session is not paid yet"
+      });
+    }
+
+    const metadata = session.metadata || {};
+    const metadataPaymentId = String(metadata.paymentId || metadata.payment_id || "").trim();
+    if (!metadataPaymentId) {
+      console.warn("[payments] Confirmed Stripe session is missing paymentId metadata", {
+        stripeSessionId: session.id,
+        metadata
+      });
+      return res.status(400).json({
+        ok: false,
+        error: "Missing paymentId in Stripe session metadata",
+        metadata
+      });
+    }
+
+    const result = await confirmStripeCheckoutSession(session, "success-page-fallback");
+
+    if (!result.ok) {
+      return res.json({
+        ...result,
+        message: "Stripe session is not paid yet"
+      });
+    }
+
+    const paymentReference = result.payment?.paymentReference || (
+      typeof session.payment_intent === "string"
+        ? session.payment_intent
+        : session.payment_intent?.id || session.id
+    );
+
+    console.log("Stripe payment confirmed:", {
+      paymentId: result.paymentId,
+      orderId: result.orderId,
+      tableId: result.tableId
+    });
+
+    return res.json({
+      ...result,
+      ok: true,
+      status: "successful",
+      stripeSessionId: session.id,
+      paymentReference
+    });
+  } catch (error) {
+    console.error("Confirm Stripe session failed:", error);
+    return res.status(error.statusCode || error.status || 500).json({
+      ok: false,
+      error: error.message || "Confirm session failed"
+    });
+  }
+}
+
+app.get("/api/payments/confirm-session", handleConfirmStripeSession);
+app.get("/api/public/payments/confirm-session", handleConfirmStripeSession);
+
 app.post("/api/payments/stripe/create-checkout-session", protectedRoute((req, res, user) => {
   return handleCreateStripeCheckoutSession(req, res, {
     source: "staff_backend",
+    method: "card",
+    user
+  });
+}));
+
+app.post("/api/payments/revolut/create-order", protectedRoute((req, res, user) => {
+  return handleCreateStripeCheckoutSession(req, res, {
+    source: "staff_backend",
+    method: "revolut",
     user
   });
 }));
@@ -578,12 +1058,6 @@ app.post("/api/payments/check", protectedRoute((req, res) => {
 }));
 
 app.post("/api/payments/bank-transfer/create", protectedRoute(handleCreateBankTransfer));
-
-app.post("/api/payments/revolut/create-order", protectedRoute(async (req, res) => {
-  res.status(501).json({
-    error: "Revolut is not configured in this payment backend."
-  });
-}));
 
 app.use((req, res) => {
   res.status(404).json({
